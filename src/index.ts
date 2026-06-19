@@ -1,52 +1,201 @@
 /**
- * Cloudflare Workers AI চ্যাট এবং এডমিন ইন্টারফেস ব্যাকএন্ড
- * এই ফাইলটি একাধারে ফ্রন্টএন্ড ইন্টারফেস এবং ব্যাকএন্ড এপিআই হ্যান্ডেল করে (স্ট্রিমিং সাপোর্ট সহ)।
+ * Cloudflare Workers AI চ্যাট, KV স্টোরেজ, D1 Database, MCP এবং সম্পূর্ণ GitHub Repository Workspace।
+ * এর মাধ্যমে সরাসরি ফাইল ব্রাউজ, এডিট এবং গিটহাবে কমিট (Commit) করা সম্ভব।
  */
 
-export interface ChatMessage {
-  role: "system" | "user" | "assistant";
-  content: string;
+export interface Env {
+  AI: any; 
+  KV: KVNamespace; 
+  DB: D1Database; 
+  ASSETS: { fetch: typeof fetch };
 }
 
-export interface Env {
-  AI: any; // ক্লাউডফ্লেয়ার ওয়ার্কার্স এআই বাইন্ডিং
-  KV: KVNamespace; // কেভি ডাটাবেজ বাইন্ডিং
-  ASSETS: { fetch: typeof fetch }; // স্ট্যাটিক অ্যাসেট হ্যান্ডেলার
-}
+const mcpSessions = new Map<string, ReadableStreamDefaultController>();
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // ১. চ্যাট রিকোয়েস্ট হ্যান্ডেল করা (POST /api/chat) - স্ট্রিমিং সহ
+    // ==========================================
+    // ১. GitHub Workspace API Endpoints
+    // ==========================================
+
+    // ক. রিপোজিটরি ফাইল লিস্ট এবং কনটেন্ট রিড করা (GET /api/github/contents)
+    if (url.pathname === "/api/github/contents" && request.method === "POST") {
+      try {
+        const { token, owner, repo, path } = await request.json() as any;
+        if (!token || !owner || !repo) {
+          return new Response(JSON.stringify({ error: "টোকেন, ওনার এবং রিপোজিটরি নাম আবশ্যক।" }), { status: 400 });
+        }
+
+        const targetUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path || ""}`;
+        const response = await fetch(targetUrl, {
+          method: "GET",
+          headers: {
+            "Authorization": `Bearer ${token}`,
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "Cloudflare-Workers-GitHub-Workspace"
+          }
+        });
+
+        const data = await response.json();
+        return new Response(JSON.stringify({ status: response.status, data }), {
+          headers: { "Content-Type": "application/json" }
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500 });
+      }
+    }
+
+    // খ. ফাইল এডিট করে সরাসরি Commit করা (POST /api/github/commit)
+    if (url.pathname === "/api/github/commit" && request.method === "POST") {
+      try {
+        const { token, owner, repo, path, content, sha, message } = await request.json() as any;
+        if (!token || !owner || !repo || !path || !content) {
+          return new Response(JSON.stringify({ error: "প্রয়োজনীয় ফাইল ইনফরমেশন অনুপস্থিত।" }), { status: 400 });
+        }
+
+        const targetUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+        
+        // ফাইল কনটেন্টকে Base64 এ রূপান্তর করা
+        const base64Content = btoa(unescape(encodeURIComponent(content)));
+
+        const response = await fetch(targetUrl, {
+          method: "PUT",
+          headers: {
+            "Authorization": `Bearer ${token}`,
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "Cloudflare-Workers-GitHub-Workspace"
+          },
+          body: JSON.stringify({
+            message: message || "Updated via Workers Super-Admin Workspace",
+            content: base64Content,
+            sha: sha || undefined // ফাইল আপডেট করতে পূর্বের SHA প্রয়োজন হয়
+          })
+        });
+
+        const data = await response.json();
+        return new Response(JSON.stringify({ status: response.status, data }), {
+          headers: { "Content-Type": "application/json" }
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500 });
+      }
+    }
+
+    // ==========================================
+    // ২. MCP (Model Context Protocol) SSE সার্ভার
+    // ==========================================
+    if (url.pathname === "/api/mcp/sse" && request.method === "GET") {
+      const sessionId = crypto.randomUUID();
+      const stream = new ReadableStream({
+        start(controller) {
+          mcpSessions.set(sessionId, controller);
+          const endpointUrl = `${url.origin}/api/mcp/message?sessionId=${sessionId}`;
+          const initPayload = `event: endpoint\ndata: ${endpointUrl}\n\n`;
+          controller.enqueue(new TextEncoder().encode(initPayload));
+        },
+        cancel() {
+          mcpSessions.delete(sessionId);
+        }
+      });
+      return new Response(stream, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
+    }
+
+    if (url.pathname === "/api/mcp/message" && request.method === "POST") {
+      const sessionId = url.searchParams.get("sessionId");
+      if (!sessionId) return new Response("Missing sessionId", { status: 400 });
+
+      const requestBody: any = await request.json();
+      const { method, params, id } = requestBody;
+      let result: any = null;
+      let error: any = null;
+
+      try {
+        if (method === "initialize") {
+          result = {
+            protocolVersion: "2024-11-05",
+            capabilities: { tools: {} },
+            serverInfo: { name: "Cloudflare-Super-Admin-MCP", version: "1.0.0" }
+          };
+        } else if (method === "tools/list") {
+          result = {
+            tools: [
+              {
+                name: "run_sql",
+                description: "D1 database 'bd_bd' এ SQL কুয়েরি চালান।",
+                inputSchema: {
+                  type: "object",
+                  properties: { sql: { type: "string" } },
+                  required: ["sql"]
+                }
+              }
+            ]
+          };
+        } else if (method === "tools/call") {
+          const { name, arguments: args } = params;
+          if (name === "run_sql") {
+            const dbResult = await env.DB.prepare(args.sql).all();
+            result = { content: [{ type: "text", text: JSON.stringify(dbResult) }] };
+          }
+        }
+      } catch (e: any) {
+        error = { code: -32603, message: e.message };
+      }
+
+      const responsePayload: any = { jsonrpc: "2.0", id };
+      if (error) responsePayload.error = error;
+      else responsePayload.result = result;
+
+      const controller = mcpSessions.get(sessionId);
+      if (controller) {
+        const payload = `event: message\ndata: ${JSON.stringify(responsePayload)}\n\n`;
+        controller.enqueue(new TextEncoder().encode(payload));
+      }
+
+      return new Response("OK", { status: 200, headers: { "Access-Control-Allow-Origin": "*" } });
+    }
+
+    // ==========================================
+    // ৩. চ্যাট রিকোয়েস্ট (POST /api/chat)
+    // ==========================================
     if (url.pathname === "/api/chat" && request.method === "POST") {
       try {
         const body: any = await request.json();
-        const { messages, systemPrompt, model, adminMode } = body;
+        const { messages, systemPrompt, model, adminMode, activeRepoFiles } = body;
 
-        // ডিফল্ট মডেল নির্বাচন (যদি ইউজার কোনো মডেল সিলেক্ট না করে)
         const selectedModel = model || "@cf/meta/llama-3.1-8b-instruct-fp8";
 
-        // এডমিন অ্যাক্সেস প্রম্পট প্রসেসিং
         let finalSystemPrompt = systemPrompt || "আপনি একজন চ্যাট অ্যাসিস্ট্যান্ট।";
         if (adminMode) {
-          finalSystemPrompt += " [ADMIN MODE ACTIVE] আপনি এখন এই অ্যাপের সুপ্রিম এডমিন। আপনার কাছে ডেটাবেজ পরিবর্তন ও সিস্টেম মনিটরিং করার পূর্ণ ক্ষমতা রয়েছে। আপনি যেকোনো প্রশ্নের উত্তর বাংলায় দিবেন এবং সম্পূর্ণ পেশাদার এডমিন হিসেবে আচরণ করবেন।";
+          finalSystemPrompt += ` [SUPER-ADMIN & GITHUB WORKSPACE ACTIVE]
+          আপনি এখন ইউজারের সম্পূর্ণ প্রজেক্ট রিপোজিটরি ব্রাউজ করতে পারেন এবং সেগুলোর ফাইল এডিট বা নতুন কোড লেখার ফুল অ্যাক্সেস রাখেন।
+          
+          বর্তমানে একটিভ রিপোজিটরির ফাইল স্কিমা ও ডিরেক্টরি নিচে দেওয়া হলো:
+          ${activeRepoFiles ? JSON.stringify(activeRepoFiles) : "কোনো ফাইল এখনও লোড করা হয়নি।"}
+
+          ইউজার যদি কোনো ফাইলের কোড আপডেট করতে বলে, তাহলে আপনি ফাইলটির নাম ও প্রয়োজনীয় কোড বাংলায় বুঝিয়ে লিখুন। ব্যবহারকারীকে যেকোনো ফাইল কমিট (Commit) করতে সাহায্য করুন।`;
         }
 
-        // মেসেজ লিস্টের শুরুতে সিস্টেম প্রম্পট যোগ করা
         const fullMessages = [
           { role: "system", content: finalSystemPrompt },
           ...messages
         ];
 
-        // ক্লাউডফ্লেয়ার ওয়ার্কার্স এআই কল করা (stream: true দিয়ে)
         const stream = await env.AI.run(selectedModel, {
           messages: fullMessages,
           max_tokens: 2048,
           stream: true
         });
 
-        // স্ট্রিমিং রেসপন্স পাঠানো
         return new Response(stream, {
           headers: {
             "content-type": "text/event-stream; charset=utf-8",
@@ -62,11 +211,26 @@ export default {
       }
     }
 
-    // ২. কেভি অ্যাডমিন অ্যাকশন হ্যান্ডেল করা (GET/POST /api/admin/kv)
+    // D1 SQL রানার গেটওয়ে
+    if (url.pathname === "/api/admin/query" && request.method === "POST") {
+      try {
+        const { sql } = await request.json() as { sql: string };
+        const result = await env.DB.prepare(sql).all();
+        return new Response(JSON.stringify({ success: true, result }), {
+          headers: { "Content-Type": "application/json" }
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ success: false, error: err.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
+    // KV এডমিন অ্যাকশন
     if (url.pathname.startsWith("/api/admin/kv")) {
       try {
         if (request.method === "GET") {
-          // KV থেকে সব কি (keys) রিড করা
           const list = await env.KV.list();
           const items = [];
           for (const key of list.keys) {
@@ -77,7 +241,6 @@ export default {
             headers: { "Content-Type": "application/json" }
           });
         } else if (request.method === "POST") {
-          // KV-তে নতুন ডেটা রাইট করা
           const { key, value } = await request.json() as any;
           await env.KV.put(key, value);
           return new Response(JSON.stringify({ success: true }), {
@@ -89,24 +252,22 @@ export default {
       }
     }
 
-    // ৩. রুট পাথে এইচটিএমএল ফ্রন্টএন্ড প্রদর্শন করা (GET /)
-    return new Response(getHTMLContent(), {
+    // রুট পাথে ফ্রন্টএন্ড প্রদর্শন
+    return new Response(getHTMLContent(url.origin), {
       headers: { "Content-Type": "text/html; charset=utf-8" }
     });
   }
 };
 
-// প্রিমিয়াম এবং ডাইনামিক ফ্রন্টএন্ড কোড (বাংলা ভাষা, লাইভ স্ট্রিমিং ও কাস্টম এডমিন প্যানেলসহ)
-function getHTMLContent(): string {
+// ফ্রন্টএন্ড লেআউট ডিজাইন
+function getHTMLContent(origin: string): string {
   return `<!DOCTYPE html>
 <html lang="bn">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Workers AI - অ্যাডমিন চ্যাট ইন্টারফেস (Streaming)</title>
-  <!-- Tailwind CSS সিডিএন লিংক -->
+  <title>Workers AI - Super Admin & GitHub Workspace</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <!-- Lucide Icons -->
   <script src="https://unpkg.com/lucide@latest"></script>
   <style>
     body {
@@ -114,6 +275,7 @@ function getHTMLContent(): string {
     }
     .custom-scrollbar::-webkit-scrollbar {
       width: 6px;
+      height: 6px;
     }
     .custom-scrollbar::-webkit-scrollbar-track {
       background: #1e1e2e;
@@ -126,137 +288,340 @@ function getHTMLContent(): string {
 </head>
 <body class="bg-[#11121c] text-[#f8f8f2] min-h-screen flex flex-col">
 
-  <!-- মেইন হেডার -->
+  <!-- হেডার -->
   <header class="bg-[#181926] border-b border-[#2d3142] py-4 px-6 flex justify-between items-center shadow-lg">
     <div class="flex items-center gap-3">
       <div class="bg-gradient-to-tr from-purple-600 to-pink-500 p-2 rounded-xl text-white">
-        <i data-lucide="cpu" class="w-6 h-6"></i>
+        <i data-lucide="github" class="w-6 h-6 animate-pulse"></i>
       </div>
       <div>
-        <h1 class="text-xl font-bold tracking-wide bg-gradient-to-r from-purple-400 to-pink-400 bg-clip-text text-transparent">Workers AI Super-Admin Panel</h1>
-        <p class="text-xs text-[#a0a0b0]">রিয়েল-টাইম স্ট্রিমিং ও এডমিন কন্ট্রোল সেন্টার</p>
+        <h1 class="text-xl font-bold tracking-wide bg-gradient-to-r from-purple-400 to-pink-400 bg-clip-text text-transparent">AI Super-Admin & GitHub Workspace</h1>
+        <p class="text-xs text-[#a0a0b0]">D1 [bd_bd] • KV • GitHub Workspace • MCP Engine</p>
       </div>
     </div>
     <div class="flex items-center gap-4">
       <div class="flex items-center gap-2 bg-[#252636] px-3 py-1.5 rounded-full border border-[#3e405b]">
         <span class="w-2.5 h-2.5 bg-green-500 rounded-full animate-ping"></span>
-        <span class="text-xs text-green-400 font-medium">লাইভ এবং একটিভ</span>
+        <span class="text-xs text-green-400 font-medium">ওয়ার্কস্পেস লাইভ</span>
       </div>
     </div>
   </header>
 
   <!-- প্রধান লেআউট -->
-  <main class="flex-1 flex flex-col lg:flex-row overflow-hidden max-w-[1600px] w-full mx-auto">
+  <main class="flex-1 flex flex-col lg:flex-row overflow-hidden max-w-[1700px] w-full mx-auto">
     
-    <!-- বাম পাশের কন্ট্রোল ও এডমিন সেটিংস প্যানেল -->
-    <section class="w-full lg:w-[380px] bg-[#181926] p-6 border-b lg:border-b-0 lg:border-r border-[#2d3142] flex flex-col gap-6 overflow-y-auto custom-scrollbar">
+    <!-- বাম পাশের কন্ট্রোল ও কাস্টম এডমিন প্যানেল -->
+    <section class="w-full lg:w-[420px] bg-[#181926] p-6 border-b lg:border-b-0 lg:border-r border-[#2d3142] flex flex-col gap-5 overflow-y-auto custom-scrollbar">
       <div>
-        <h2 class="text-lg font-semibold mb-3 flex items-center gap-2 text-purple-400">
+        <h2 class="text-lg font-semibold mb-2 flex items-center gap-2 text-purple-400">
           <i data-lucide="sliders" class="w-5 h-5"></i> কন্ট্রোল প্যানেল
         </h2>
-        <p class="text-xs text-[#8a8a9a] mb-4">আপনার এআই-এর অ্যাক্সেস লেভেল এবং প্রম্পট কাস্টমাইজ করুন।</p>
+        <p class="text-xs text-[#8a8a9a]">রিয়েল-টাইমে গিটহাব ফাইল ও এআই টিউনিং পরিচালনা করুন।</p>
       </div>
 
-      <!-- модель সিলেকশন -->
-      <div class="flex flex-col gap-2">
-        <label class="text-sm font-medium text-gray-300">Workers AI মডেল নির্বাচন করুন:</label>
-        <select id="modelSelect" class="bg-[#252636] border border-[#3e405b] rounded-lg p-2.5 text-sm text-gray-100 outline-none focus:border-purple-500">
-          <option value="@cf/meta/llama-3.1-8b-instruct-fp8" selected>Llama 3.1 8B Instruct FP8 (ফাস্ট ও রিকোমেন্ডেড)</option>
-          <option value="@cf/meta/llama-3.1-8b-instruct">Llama 3.1 8B Instruct</option>
-          <option value="@cf/qwen/qwen1.5-14b-chat">Qwen 1.5 14B Chat (বহুভাষী দক্ষ)</option>
-          <option value="@cf/mistral/mistral-7b-instruct-v0.1">Mistral 7B Instruct</option>
+      <!-- গিটহাব ওয়ার্কস্পেস সেটিংস কার্ড -->
+      <div class="bg-gradient-to-br from-[#1b2b3a] to-[#121f2d] p-4 rounded-xl border border-blue-500/30 flex flex-col gap-3">
+        <h3 class="text-xs font-bold text-blue-300 flex items-center gap-2">
+          <i data-lucide="git-branch" class="w-4 h-4 text-blue-400"></i> Active GitHub Workspace
+        </h3>
+        
+        <div class="flex flex-col gap-2">
+          <input id="gitOwner" type="text" placeholder="GitHub Username / Owner (যেমন: octocat)" class="bg-[#11121c] border border-[#3e405b] rounded p-2 text-xs text-gray-100 outline-none focus:border-blue-500">
+          <input id="gitRepo" type="text" placeholder="Repository Name (যেমন: hello-world)" class="bg-[#11121c] border border-[#3e405b] rounded p-2 text-xs text-gray-100 outline-none focus:border-blue-500">
+          <input id="gitToken" type="password" placeholder="GitHub Token (PAT)" class="bg-[#11121c] border border-[#3e405b] rounded p-2 text-xs text-gray-100 outline-none focus:border-blue-500">
+        </div>
+
+        <button onclick="loadGitHubWorkspace()" class="w-full bg-blue-600 hover:bg-blue-700 text-white rounded py-2 text-xs font-semibold transition flex justify-center items-center gap-2">
+          <i data-lucide="refresh-cw" class="w-3.5 h-3.5 animate-spin hidden" id="repoSpinner"></i>
+          <span>Workspace লোড করুন</span>
+        </button>
+
+        <!-- ফাইল ডিরেক্টরি ট্রি ব্রাউজার -->
+        <div id="repoFiles" class="text-xs space-y-1.5 max-h-[200px] overflow-y-auto custom-scrollbar bg-[#11121c] p-2 rounded border border-[#2d3142]">
+          <span class="text-gray-500 italic block text-center">কোনো রিপোজিটরি লোড করা নেই</span>
+        </div>
+      </div>
+
+      <!-- এআই মডেল সিলেকশন ও টগল -->
+      <div class="flex flex-col gap-1.5 bg-[#252636] p-3 rounded-xl border border-[#3e405b]">
+        <label class="text-xs font-semibold text-gray-400">Workers AI মডেল:</label>
+        <select id="modelSelect" class="bg-[#11121c] border border-[#3e405b] rounded p-2 text-xs text-gray-100 outline-none">
+          <option value="@cf/meta/llama-3.1-8b-instruct-fp8" selected>Llama 3.1 8B FP8 (ফাস্ট)</option>
+          <option value="@cf/qwen/qwen1.5-14b-chat">Qwen 1.5 14B Chat</option>
         </select>
-      </div>
-
-      <!-- সুপার এডমিন মোড টগল -->
-      <div class="bg-[#252636] p-4 rounded-xl border border-[#3e405b] flex flex-col gap-3">
-        <div class="flex justify-between items-center">
-          <div class="flex items-center gap-2">
-            <i data-lucide="shield-alert" class="w-5 h-5 text-red-400"></i>
-            <span class="text-sm font-bold text-red-300">সুপার এডমিন অ্যাক্সেস</span>
-          </div>
+        
+        <div class="flex justify-between items-center mt-2 pt-2 border-t border-[#3e405b]">
+          <span class="text-xs font-bold text-red-300">সুপার এডমিন মোড</span>
           <label class="relative inline-flex items-center cursor-pointer">
             <input type="checkbox" id="adminModeToggle" checked class="sr-only peer">
-            <div class="w-11 h-6 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-red-500"></div>
+            <div class="w-9 h-5 bg-gray-700 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-red-500"></div>
           </label>
         </div>
-        <p class="text-xs text-gray-400 leading-relaxed">অ্যাক্টিভেট করলে এআই-টি ব্যাকএন্ড ডাটাবেজ কাস্টমাইজেশন ও আপনার সম্পূর্ণ সিস্টেমের ডিরেক্ট কন্ট্রোল পাবে।</p>
       </div>
 
-      <!-- কাস্টম সিস্টেম প্রম্পট -->
-      <div class="flex flex-col gap-2">
-        <label class="text-sm font-medium text-gray-300">কাস্টম সিস্টেম প্রম্পট (System Prompt):</label>
-        <textarea id="systemPrompt" rows="4" class="bg-[#252636] border border-[#3e405b] rounded-lg p-2.5 text-xs text-gray-200 outline-none focus:border-purple-500 resize-none" placeholder="এআই-কে আপনার মতো করে নির্দেশ দিন...">আপনি একজন অত্যন্ত বুদ্ধিমান এবং অনুগত এডমিন অ্যাসিস্ট্যান্ট। এডমিনের সকল কমান্ড যথাযথভাবে পূরণ করুন।</textarea>
-      </div>
-
-      <!-- KV ডাটাবেজ ইন্টিগ্রেশন কার্ড -->
-      <div class="border-t border-[#2d3142] pt-4 mt-auto">
-        <h3 class="text-sm font-bold text-gray-300 mb-2 flex items-center gap-2">
-          <i data-lucide="database" class="w-4 h-4 text-pink-400"></i> KV স্টোরেজ ডেটা
+      <!-- সরাসরি D1 SQL এক্সিকিউটর -->
+      <div class="border-t border-[#2d3142] pt-3">
+        <h3 class="text-xs font-bold text-green-400 mb-2 flex items-center gap-2">
+          <i data-lucide="terminal" class="w-4 h-4"></i> D1 'bd_bd' SQL রানার
         </h3>
-        <div id="kvList" class="text-xs space-y-2 max-h-[150px] overflow-y-auto custom-scrollbar bg-[#11121c] p-2 rounded border border-[#2d3142]">
-          <span class="text-gray-500 italic block text-center">ডেটা লোড করা হচ্ছে...</span>
+        <textarea id="sqlConsole" rows="2" class="w-full bg-[#11121c] text-green-400 font-mono p-2 rounded border border-[#3e405b] text-xs outline-none focus:border-green-500 resize-none" placeholder="SELECT name FROM sqlite_schema;"></textarea>
+        <button onclick="runSQL()" class="w-full mt-1 bg-green-600 hover:bg-green-700 text-white rounded py-1.5 text-xs font-semibold transition">SQL রান করুন</button>
+        <div id="sqlResult" class="mt-1 text-[9px] bg-[#11121c] p-2 rounded border border-[#2d3142] max-h-[100px] overflow-auto custom-scrollbar font-mono text-gray-400">
+          D1 SQL রেজাল্ট...
         </div>
-        <div class="flex gap-1.5 mt-2">
-          <input id="kvKey" type="text" placeholder="কী (Key)" class="bg-[#252636] border border-[#3e405b] rounded text-xs p-1.5 w-1/2 outline-none">
-          <input id="kvVal" type="text" placeholder="মান (Value)" class="bg-[#252636] border border-[#3e405b] rounded text-xs p-1.5 w-1/2 outline-none">
-        </div>
-        <button onclick="writeKV()" class="w-full mt-2 bg-pink-600 hover:bg-pink-700 text-white rounded py-1.5 text-xs font-semibold transition">KV-তে সেভ করুন</button>
       </div>
     </section>
 
-    <!-- ডান পাশের মূল চ্যাট ইন্টারফেস -->
-    <section class="flex-1 flex flex-col bg-[#141521] overflow-hidden">
-      <!-- চ্যাট হেড -->
-      <div class="bg-[#181926] px-6 py-3.5 border-b border-[#2d3142] flex justify-between items-center">
-        <div class="flex items-center gap-2">
-          <div class="w-2.5 h-2.5 rounded-full bg-purple-500 animate-pulse"></div>
-          <span class="text-sm font-semibold">লাইভ চ্যাট ফিড (স্ট্রিমিং সক্রিয়)</span>
-        </div>
-        <button onclick="clearChat()" class="text-xs text-gray-400 hover:text-red-400 flex items-center gap-1 transition">
-          <i data-lucide="trash-2" class="w-4 h-4"></i> চ্যাট রিসেট
-        </button>
-      </div>
-
-      <!-- চ্যাট হিস্ট্রি উইন্ডো -->
-      <div id="chatHistory" class="flex-1 overflow-y-auto p-6 space-y-4 custom-scrollbar">
-        <!-- প্রথম স্বাগতম মেসেজ -->
-        <div class="flex gap-4 max-w-[85%]">
-          <div class="w-9 h-9 rounded-xl bg-purple-600 flex items-center justify-center text-white shrink-0">
-            <i data-lucide="bot" class="w-5 h-5"></i>
+    <!-- ডান পাশের মূল চ্যাট ইন্টারফেস ও ফাইল রিডার / এডিটর প্যানেল -->
+    <section class="flex-1 flex flex-col lg:flex-row bg-[#141521] overflow-hidden">
+      
+      <!-- চ্যাট ফিড -->
+      <div class="flex-1 flex flex-col border-r border-[#2d3142]">
+        <div class="bg-[#181926] px-6 py-3.5 border-b border-[#2d3142] flex justify-between items-center">
+          <div class="flex items-center gap-2">
+            <div class="w-2.5 h-2.5 rounded-full bg-purple-500 animate-pulse"></div>
+            <span class="text-sm font-semibold">লাইভ চ্যাট অ্যাসিস্ট্যান্ট</span>
           </div>
-          <div class="bg-[#1e1f30] p-4 rounded-2xl rounded-tl-none border border-[#2d3142]">
-            <p class="text-sm leading-relaxed text-gray-100">হ্যালো এডমিন! আমি আপনার Workers AI অ্যাসিস্ট্যান্ট। আজকের এডমিন সেশনে আপনাকে স্বাগতম। আমার রেসপন্স স্ট্রিমিং এখন সক্রিয় আছে। কিভাবে সাহায্য করতে পারি?</p>
-            <span class="text-[10px] text-gray-500 mt-2 block">সিস্টেম অ্যাসিস্ট্যান্ট</span>
-          </div>
-        </div>
-      </div>
-
-      <!-- মেসেজ পাঠানোর ইনপুট বার -->
-      <div class="p-4 bg-[#181926] border-t border-[#2d3142]">
-        <form id="chatForm" onsubmit="sendMessage(event)" class="flex gap-3">
-          <input id="userMessage" type="text" required placeholder="এডমিন কমান্ড অথবা প্রশ্ন এখানে লিখুন..." class="flex-1 bg-[#1e1f30] border border-[#2d3142] rounded-xl px-4 py-3.5 text-sm text-gray-100 placeholder-gray-500 outline-none focus:border-purple-500 transition">
-          <button id="sendBtn" type="submit" class="bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white font-semibold px-6 rounded-xl flex items-center gap-2 transition">
-            <span>পাঠান</span>
-            <i data-lucide="send" class="w-4 h-4"></i>
+          <button onclick="clearChat()" class="text-xs text-gray-400 hover:text-red-400 flex items-center gap-1 transition">
+            <i data-lucide="trash-2" class="w-4 h-4"></i> রিসেট চ্যাট
           </button>
-        </form>
+        </div>
+
+        <!-- চ্যাট হিস্ট্রি -->
+        <div id="chatHistory" class="flex-1 overflow-y-auto p-6 space-y-4 custom-scrollbar">
+          <div class="flex gap-4 max-w-[85%]">
+            <div class="w-9 h-9 rounded-xl bg-purple-600 flex items-center justify-center text-white shrink-0">
+              <i data-lucide="bot" class="w-5 h-5"></i>
+            </div>
+            <div class="bg-[#1e1f30] p-4 rounded-2xl rounded-tl-none border border-[#2d3142]">
+              <p class="text-sm leading-relaxed text-gray-100">হ্যালো সুপার-এডমিন! আপনার চ্যাটবটটি এখন <b>GitHub Workspace</b> এর সাথে কানেক্টেড। বাম পাশে রিপোজিটরি ইনফরমেশন দিলে আমি স্বয়ংক্রিয়ভাবে প্রজেক্ট ফাইলগুলো রিড করে আপনাকে রিয়েল-টাইমে কোডিং সহায়তা করতে পারব।</p>
+              <span class="text-[10px] text-gray-500 mt-2 block">সিস্টেম অ্যাসিস্ট্যান্ট</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- ইনপুট বার -->
+        <div class="p-4 bg-[#181926] border-t border-[#2d3142]">
+          <form id="chatForm" onsubmit="sendMessage(event)" class="flex gap-3">
+            <input id="userMessage" type="text" required placeholder="ফাইলের নাম লিখে এআই-কে জিজ্ঞেস করুন বা যেকোনো সাহায্য চান..." class="flex-1 bg-[#1e1f30] border border-[#2d3142] rounded-xl px-4 py-3.5 text-sm text-gray-100 placeholder-gray-500 outline-none focus:border-purple-500 transition">
+            <button id="sendBtn" type="submit" class="bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white font-semibold px-6 rounded-xl flex items-center gap-2 transition">
+              <span>পাঠান</span>
+              <i data-lucide="send" class="w-4 h-4"></i>
+            </button>
+          </form>
+        </div>
       </div>
+
+      <!-- রাইট সাইড ফাইল রিডার ও কোড এডিটর (Commit Action) -->
+      <div class="w-full lg:w-[480px] bg-[#1a1b26] flex flex-col border-t lg:border-t-0 border-[#2d3142]">
+        <div class="bg-[#1f2030] px-4 py-3 border-b border-[#2d3142] flex justify-between items-center">
+          <div class="flex items-center gap-2">
+            <i data-lucide="file-code" class="w-4 h-4 text-blue-400"></i>
+            <span class="text-xs font-semibold text-gray-200" id="currentFileName">কোড ভিউয়ার (কোনো ফাইল ওপেন নেই)</span>
+          </div>
+          <button id="commitBtn" onclick="commitCodeChange()" disabled class="bg-green-600 hover:bg-green-700 text-white text-[11px] font-bold px-3 py-1.5 rounded transition opacity-50 cursor-not-allowed">
+            গিটহাবে Commit করুন
+          </button>
+        </div>
+        
+        <textarea id="fileEditor" class="flex-1 bg-[#11121c] text-green-300 font-mono p-4 text-xs outline-none resize-none custom-scrollbar" placeholder="// ফাইল সিলেক্ট করলে ফাইলের কোড এখানে রিড/রাইট করা যাবে..."></textarea>
+        
+        <div class="bg-[#1f2030] p-3 border-t border-[#2d3142] flex flex-col gap-2">
+          <label class="text-[10px] font-bold text-gray-400">Commit Message:</label>
+          <input id="commitMsg" type="text" value="Updated file using Cloudflare Super-Admin Space" class="bg-[#11121c] border border-[#3e405b] rounded p-2 text-xs text-gray-100 outline-none">
+        </div>
+      </div>
+
     </section>
 
   </main>
 
   <script>
-    // লাইভ চ্যাট ডেটা স্টোর
     let messages = [];
+    let currentLoadedFiles = []; // এআই কন্টেন্ট সিস্টেমে পাঠাতে ফাইল স্ট্রাকচার স্টোর
+    let activeFileSHA = ""; // গিটহাব ফাইল আপডেটের জন্য SHA স্টোর
+    let activeFilePath = ""; // এডিটিং ফাইলের পাথ
 
-    // পেজ লোড হলে আইকন ও কেভি লিস্ট রেন্ডার করা
     window.onload = function() {
       lucide.createIcons();
-      fetchKVData();
+      loadSavedGitConfig();
     };
 
-    // ১. চ্যাট মেসেজ সেন্ড করা এবং সার্ভার থেকে SSE স্ট্রিমিং ডেটা রিসিভ করা
+    // লোকাল স্টোরেজ থেকে পূর্বে সেভ করা কনফিগ পুনরুদ্ধার
+    function loadSavedGitConfig() {
+      const owner = localStorage.getItem("git_owner");
+      const repo = localStorage.getItem("git_repo");
+      const token = localStorage.getItem("git_token");
+      if (owner) document.getElementById("gitOwner").value = owner;
+      if (repo) document.getElementById("gitRepo").value = repo;
+      if (token) document.getElementById("gitToken").value = token;
+    }
+
+    // ১. গিটহাব ওয়ার্কস্পেস লোড করা
+    async function loadGitHubWorkspace() {
+      const owner = document.getElementById("gitOwner").value.trim();
+      const repo = document.getElementById("gitRepo").value.trim();
+      const token = document.getElementById("gitToken").value.trim();
+      const spinner = document.getElementById("repoSpinner");
+      const fileContainer = document.getElementById("repoFiles");
+
+      if (!owner || !repo || !token) {
+        alert("গিটহাব কনফিগারেশন পূর্ণাঙ্গভাবে দিন!");
+        return;
+      }
+
+      // কনফিগ সেভ করা
+      localStorage.setItem("git_owner", owner);
+      localStorage.setItem("git_repo", repo);
+      localStorage.setItem("git_token", token);
+
+      spinner.classList.remove("hidden");
+      fileContainer.innerHTML = "ফাইল লিস্ট লোড করা হচ্ছে...";
+
+      try {
+        const response = await fetch("/api/github/contents", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token, owner, repo, path: "" })
+        });
+        const resData = await response.json();
+
+        if (resData.status === 200 && Array.isArray(resData.data)) {
+          currentLoadedFiles = resData.data;
+          fileContainer.innerHTML = "";
+          
+          resData.data.forEach(file => {
+            const isDir = file.type === "dir";
+            const icon = isDir ? "folder" : "file-code";
+            const colorClass = isDir ? "text-yellow-500" : "text-blue-400";
+            
+            const div = document.createElement("div");
+            div.className = "flex items-center justify-between hover:bg-[#1f2030] p-1 rounded cursor-pointer transition";
+            div.innerHTML = \`
+              <span onclick="openFile('\${file.path}', '\${file.sha}')" class="flex items-center gap-1.5 truncate">
+                <i data-lucide="\${icon}" class="w-3.5 h-3.5 \${colorClass}"></i>
+                <span class="truncate">\${file.name}</span>
+              </span>
+            \`;
+            fileContainer.appendChild(div);
+          });
+          lucide.createIcons();
+        } else {
+          fileContainer.innerHTML = \`<span class="text-red-500 block text-center">লোড ব্যর্থ! ত্রুটি: \${resData.data.message || 'Error'}</span>\`;
+        }
+      } catch (err) {
+        fileContainer.innerHTML = '<span class="text-red-500 block text-center">সার্ভার এরর!</span>';
+      } finally {
+        spinner.classList.add("hidden");
+      }
+    }
+
+    // ২. স্পেসিফিক ফাইল ওপেন করা
+    async function openFile(path, sha) {
+      const owner = document.getElementById("gitOwner").value.trim();
+      const repo = document.getElementById("gitRepo").value.trim();
+      const token = document.getElementById("gitToken").value.trim();
+      const editor = document.getElementById("fileEditor");
+      const fileNameView = document.getElementById("currentFileName");
+      const commitBtn = document.getElementById("commitBtn");
+
+      editor.value = "ফাইল কন্টেন্ট ডাউনলোড হচ্ছে...";
+      fileNameView.innerHTML = path;
+      activeFilePath = path;
+      activeFileSHA = sha;
+
+      try {
+        const response = await fetch("/api/github/contents", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token, owner, repo, path })
+        });
+        const resData = await response.json();
+
+        if (resData.status === 200 && resData.data.content) {
+          // Base64 থেকে ডিকোড করা
+          const decodedContent = decodeURIComponent(escape(atob(resData.data.content)));
+          editor.value = decodedContent;
+          commitBtn.disabled = false;
+          commitBtn.classList.remove("opacity-50", "cursor-not-allowed");
+        } else {
+          editor.value = "ফাইলটি ওপেন করা সম্ভব হয়নি।";
+        }
+      } catch (err) {
+        editor.value = "ডাউনলোড এরর!";
+      }
+    }
+
+    // ৩. ফাইল মডিফাই করে Commit করা
+    async function commitCodeChange() {
+      const owner = document.getElementById("gitOwner").value.trim();
+      const repo = document.getElementById("gitRepo").value.trim();
+      const token = document.getElementById("gitToken").value.trim();
+      const content = document.getElementById("fileEditor").value;
+      const message = document.getElementById("commitMsg").value.trim();
+      const commitBtn = document.getElementById("commitBtn");
+
+      if (!activeFilePath) return;
+
+      commitBtn.disabled = true;
+      commitBtn.innerHTML = "Commit হচ্ছে...";
+
+      try {
+        const response = await fetch("/api/github/commit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            token,
+            owner,
+            repo,
+            path: activeFilePath,
+            content,
+            sha: activeFileSHA,
+            message
+          })
+        });
+
+        const data = await response.json();
+        if (data.status === 200) {
+          alert("সফলভাবে গিটহাবে Commit ও Push সম্পন্ন হয়েছে!");
+          // ফাইল লিস্ট রিফ্রেশ করা নতুন SHA পেতে
+          loadGitHubWorkspace();
+        } else {
+          alert("Commit ব্যর্থ হয়েছে! ত্রুটি: " + (data.data.message || "Unknown"));
+        }
+      } catch (err) {
+        alert("কানেকশন এরর!");
+      } finally {
+        commitBtn.disabled = false;
+        commitBtn.innerHTML = "গিটহাবে Commit করুন";
+      }
+    }
+
+    // ৪. সরাসরি SQL রানার
+    async function runSQL() {
+      const sql = document.getElementById("sqlConsole").value.trim();
+      const resultView = document.getElementById("sqlResult");
+      if (!sql) return;
+
+      resultView.innerHTML = "কুয়েরি রান হচ্ছে...";
+      try {
+        const response = await fetch("/api/admin/query", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sql })
+        });
+        const data = await response.json();
+        if (data.success) {
+          resultView.innerHTML = JSON.stringify(data.result, null, 2);
+        } else {
+          resultView.innerHTML = "ত্রুটি: " + data.error;
+        }
+      } catch (err) {
+        resultView.innerHTML = "কানেকশন এরর!";
+      }
+    }
+
+    // ৫. চ্যাট মেসেজ ও স্ট্রিমিং (Active Files Context সহ)
     async function sendMessage(e) {
       e.preventDefault();
       const inputEl = document.getElementById("userMessage");
@@ -266,18 +631,14 @@ function getHTMLContent(): string {
       const sendBtn = document.getElementById("sendBtn");
       sendBtn.disabled = true;
 
-      // ইউজার মেসেজ চ্যাটে যুক্ত করুন
       appendMessage("user", messageText);
       inputEl.value = "";
 
-      // এপিআই পে-লোড তৈরিকরণ
       messages.push({ role: "user", content: messageText });
       
-      const systemPrompt = document.getElementById("systemPrompt").value;
       const model = document.getElementById("modelSelect").value;
       const adminMode = document.getElementById("adminModeToggle").checked;
 
-      // প্রথম লোডিং এনিমেশন দেখান
       const loadingId = appendLoadingMessage();
 
       try {
@@ -286,17 +647,14 @@ function getHTMLContent(): string {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             messages,
-            systemPrompt,
             model,
-            adminMode
+            adminMode,
+            activeRepoFiles: currentLoadedFiles.map(f => ({ name: f.name, path: f.path, type: f.type }))
           })
         });
 
-        if (!response.ok) {
-          throw new Error("সার্ভার রেসপন্স করতে ব্যর্থ হয়েছে।");
-        }
+        if (!response.ok) throw new Error("সার্ভার রেসপন্স ব্যর্থ!");
 
-        // লোডিং বন্ধ করে এআই এর জন্য খালি বাবল তৈরি করুন যেখানে লেখা স্ট্রিমিং হবে
         removeLoadingMessage(loadingId);
         const assistantMessageId = appendEmptyAssistantMessage();
 
@@ -309,40 +667,33 @@ function getHTMLContent(): string {
           if (done) break;
 
           const chunk = decoder.decode(value, { stream: true });
-          // Workers AI সাধারণত "data: { ... }" ফরম্যাটে রেসপন্স দেয়
           const lines = chunk.split("\\n");
           for (const line of lines) {
             const trimmed = line.trim();
             if (trimmed.startsWith("data: ")) {
               const dataStr = trimmed.slice(6).trim();
-              if (dataStr === "[DONE]") {
-                break;
-              }
+              if (dataStr === "[DONE]") break;
               try {
                 const parsed = JSON.parse(dataStr);
                 if (parsed.response) {
                   assistantMessageText += parsed.response;
                   updateAssistantMessage(assistantMessageId, assistantMessageText);
                 }
-              } catch (err) {
-                // আংশিক লাইনের জন্য পার্স এরর স্কিপ করুন
-              }
+              } catch (err) {}
             }
           }
         }
 
-        // হিস্ট্রিতে এআই মেসেজ পুশ করা
         messages.push({ role: "assistant", content: assistantMessageText });
 
       } catch (error) {
         removeLoadingMessage(loadingId);
-        appendMessage("assistant", "ত্রুটি: সার্ভারের সাথে সংযোগ স্থাপন করা যায়নি বা সমস্যা হয়েছে।");
+        appendMessage("assistant", "ত্রুটি: সার্ভারের সাথে সংযোগ স্থাপন করা যায়নি।");
       } finally {
         sendBtn.disabled = false;
       }
     }
 
-    // সাধারণ মেসেজ রেন্ডার করার ফাংশন
     function appendMessage(role, text) {
       const chatHistory = document.getElementById("chatHistory");
       const messageDiv = document.createElement("div");
@@ -360,7 +711,7 @@ function getHTMLContent(): string {
         \${avatar}
         <div class="\${bubbleClass} order-1">
           <p class="text-sm leading-relaxed text-gray-100 text-left">\${text.replace(/\\n/g, '<br>')}</p>
-          <span class="text-[10px] text-gray-500 mt-2 block">\${role === 'user' ? 'এডমিন (ইউজার)' : 'Workers AI'}</span>
+          <span class="text-[10px] text-gray-500 mt-2 block">\${role === 'user' ? 'এডমিন' : 'Workers AI'}</span>
         </div>
       \`;
 
@@ -369,7 +720,6 @@ function getHTMLContent(): string {
       lucide.createIcons();
     }
 
-    // স্ট্রিমিং এর জন্য একটি খালি এআই মেসেজ বাবল তৈরি করা
     function appendEmptyAssistantMessage() {
       const id = "ai-msg-" + Date.now();
       const chatHistory = document.getElementById("chatHistory");
@@ -391,20 +741,15 @@ function getHTMLContent(): string {
       return id;
     }
 
-    // রিয়েল-টাইমে চ্যাটের ভেতরের টেক্সট আপডেট করার ফাংশন
     function updateAssistantMessage(id, text) {
       const textEl = document.getElementById(id + "-text");
       if (textEl) {
-        // নতুন লাইন ও ফরম্যাটিং ঠিক রাখা
         textEl.innerHTML = text.replace(/\\n/g, '<br>');
-        
-        // স্ক্রোল নিচে নামানো
         const chatHistory = document.getElementById("chatHistory");
         chatHistory.scrollTop = chatHistory.scrollHeight;
       }
     }
 
-    // লোডিং প্লেসহোল্ডার মেসেজ
     function appendLoadingMessage() {
       const id = "loading-" + Date.now();
       const chatHistory = document.getElementById("chatHistory");
@@ -430,7 +775,6 @@ function getHTMLContent(): string {
       if (el) el.remove();
     }
 
-    // চ্যাট মুছে ফেলা
     function clearChat() {
       messages = [];
       const chatHistory = document.getElementById("chatHistory");
@@ -445,48 +789,6 @@ function getHTMLContent(): string {
         </div>
       \`;
       lucide.createIcons();
-    }
-
-    // ২. KV ডাটাবেজ ডেটা রেন্ডারিং
-    async function fetchKVData() {
-      const container = document.getElementById("kvList");
-      try {
-        const response = await fetch("/api/admin/kv");
-        const data = await response.json();
-        if (data.items && data.items.length > 0) {
-          container.innerHTML = "";
-          data.items.forEach(item => {
-            const div = document.createElement("div");
-            div.className = "flex justify-between items-center border-b border-[#2d3142] pb-1";
-            div.innerHTML = \`<span class="text-pink-400 font-mono">\${item.key}</span><span class="text-gray-300">\${item.value}</span>\`;
-            container.appendChild(div);
-          });
-        } else {
-          container.innerHTML = '<span class="text-gray-600 block text-center">কোনো ডেটা পাওয়া যায়নি</span>';
-        }
-      } catch (err) {
-        container.innerHTML = '<span class="text-red-500 block text-center">KV লোড করা ব্যর্থ হয়েছে</span>';
-      }
-    }
-
-    // নতুন KV জোড়া
-    async function writeKV() {
-      const key = document.getElementById("kvKey").value.trim();
-      const value = document.getElementById("kvVal").value.trim();
-      if (!key || !value) return;
-
-      try {
-        await fetch("/api/admin/kv", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ key, value })
-        });
-        document.getElementById("kvKey").value = "";
-        document.getElementById("kvVal").value = "";
-        fetchKVData();
-      } catch (err) {
-        alert("KV ডাটাবেজ রাইট করতে সমস্যা হয়েছে!");
-      }
     }
   </script>
 </body>
