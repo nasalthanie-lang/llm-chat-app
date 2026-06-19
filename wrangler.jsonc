@@ -19,4 +19,12 @@
 		"binding": "AI"
 	},
 	"upload_source_maps": true
-}
+},
+  "kv_namespaces":
+    {
+      "binding": "KV",
+      "id": "4052b4e06bab4191b1a72a5e6d1f6da5",
+      
+      // Optional: preview_id used when running `wrangler dev` for local dev
+      "preview_id": "<ID_OF_PREVIEW_KV_NAMESPACE_FOR_LOCAL_DEVELOPMENT>"
+    }
