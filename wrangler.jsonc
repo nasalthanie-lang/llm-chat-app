@@ -20,5 +20,12 @@
 			"binding": "KV",
 			"id": "4052b4e06bab4191b1a72a5e6d1f6da5"
 		}
+	],
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "bd_bd",
+			"database_id": "25a83a36-6582-49ba-b939-4824ab846219"
+		}
 	]
 }
